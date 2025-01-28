@@ -1,6 +1,12 @@
 async function fetchVideoInfo() {
     const videoUrl = document.getElementById('videoUrl').value;
+    const button = document.querySelector('.input-container button');
     if (!videoUrl) return;
+
+    // Store original button text and disable button
+    const originalText = button.textContent;
+    button.disabled = true;
+    button.innerHTML = '<div class="spinner"></div>';
 
     try {
         const response = await fetch('/api/video-info', {
@@ -17,6 +23,10 @@ async function fetchVideoInfo() {
         displayVideoInfo(data);
     } catch (error) {
         alert('Error: ' + error.message);
+    } finally {
+        // Restore button state
+        button.disabled = false;
+        button.textContent = originalText;
     }
 }
 
@@ -30,11 +40,20 @@ function displayVideoInfo(info) {
         <p>Duration: ${info.duration}</p>
     `;
 
-    downloadOptions.innerHTML = '';
+    downloadOptions.innerHTML = `
+        <div class="download-column">
+            <h3>Audio</h3>
+            <div id="audioOptions"></div>
+        </div>
+        <div class="download-column">
+            <h3>Video</h3>
+            <div id="videoOptions"></div>
+        </div>
+    `;
     
     // Add audio download option
     const audioButton = createDownloadButton('Download Audio (Best Quality)', 'audio');
-    downloadOptions.appendChild(audioButton);
+    document.getElementById('audioOptions').appendChild(audioButton);
 
     // Add video download options
     info.formats.forEach(format => {
@@ -43,7 +62,7 @@ function displayVideoInfo(info) {
             'video',
             format.formatId
         );
-        downloadOptions.appendChild(button);
+        document.getElementById('videoOptions').appendChild(button);
     });
 
     videoInfo.classList.remove('hidden');
@@ -53,6 +72,10 @@ function createDownloadButton(text, type, formatId = '') {
     const button = document.createElement('button');
     button.textContent = text;
     button.className = 'download-button';
+    
+    // Create a unique ID for the button based on type and formatId
+    button.id = `download-${type}-${formatId || 'audio'}`;
+    
     button.onclick = () => downloadMedia(type, formatId);
     return button;
 }
@@ -60,6 +83,17 @@ function createDownloadButton(text, type, formatId = '') {
 async function downloadMedia(type, formatId = '') {
     const videoUrl = document.getElementById('videoUrl').value;
     if (!videoUrl) return;
+
+    // Find the clicked button by its unique ID
+    const buttonId = `download-${type}-${formatId || 'audio'}`;
+    const clickedButton = document.getElementById(buttonId);
+    
+    if (!clickedButton) return;
+
+    // Disable the button and show loading state
+    const originalText = clickedButton.textContent;
+    clickedButton.disabled = true;
+    clickedButton.innerHTML = '<div class="spinner"></div> Downloading...';
 
     try {
         const response = await fetch('/api/download', {
@@ -75,8 +109,16 @@ async function downloadMedia(type, formatId = '') {
         });
 
         if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.error);
+            // Try to parse as JSON first, fall back to text if that fails
+            const errorText = await response.text();
+            let errorMessage;
+            try {
+                const errorJson = JSON.parse(errorText);
+                errorMessage = errorJson.error;
+            } catch {
+                errorMessage = errorText;
+            }
+            throw new Error(errorMessage);
         }
 
         // Get filename from Content-Disposition header
@@ -95,5 +137,9 @@ async function downloadMedia(type, formatId = '') {
         document.body.removeChild(a);
     } catch (error) {
         alert('Error: ' + error.message);
+    } finally {
+        // Restore button state
+        clickedButton.disabled = false;
+        clickedButton.textContent = originalText;
     }
 } 

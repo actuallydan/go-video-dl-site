@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 )
 
 type VideoRequest struct {
@@ -57,6 +59,29 @@ func main() {
 	}
 }
 
+func getClientIP(r *http.Request) string {
+	// Check Fly.io specific header first
+	ip := r.Header.Get("Fly-Client-IP")
+	if ip != "" {
+		return ip
+	}
+
+	// Then check X-Forwarded-For
+	ip = r.Header.Get("X-Forwarded-For")
+	if ip != "" {
+		return ip
+	}
+
+	// Check X-Real-IP
+	ip = r.Header.Get("X-Real-IP")
+	if ip != "" {
+		return ip
+	}
+
+	// Finally fall back to RemoteAddr
+	return r.RemoteAddr
+}
+
 func handleVideoInfo(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -84,6 +109,12 @@ func handleVideoInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Add logging after getting video info
+	log.Printf("Info request - IP: %s, URL: %s, Title: %s",
+		getClientIP(r),
+		req.URL,
+		rawInfo["title"].(string))
+
 	// Extract relevant information
 	info := VideoInfo{
 		Title:    rawInfo["title"].(string),
@@ -93,19 +124,53 @@ func handleVideoInfo(w http.ResponseWriter, r *http.Request) {
 
 	// Extract format information
 	formats := rawInfo["formats"].([]interface{})
+	seenQualities := make(map[string]bool)
+
 	for _, f := range formats {
 		format := f.(map[string]interface{})
-		if format["vcodec"] != "none" && format["acodec"] != "none" {
-			info.Formats = append(info.Formats, VideoFormat{
-				FormatID: format["format_id"].(string),
-				Quality:  format["format_note"].(string),
-				Ext:      format["ext"].(string),
-			})
+
+		// Skip formats without video
+		if format["vcodec"] == "none" {
+			continue
 		}
+
+		quality := "Unknown"
+		if height, ok := format["height"].(float64); ok {
+			quality = fmt.Sprintf("%dp", int(height))
+		} else if formatNote, ok := format["format_note"].(string); ok {
+			quality = formatNote
+		}
+
+		// Skip duplicates of the same quality
+		if seenQualities[quality] {
+			continue
+		}
+		seenQualities[quality] = true
+
+		info.Formats = append(info.Formats, VideoFormat{
+			FormatID: format["format_id"].(string),
+			Quality:  quality,
+			Ext:      format["ext"].(string),
+		})
 	}
+
+	// Sort formats by quality (resolution) in descending order
+	sort.Slice(info.Formats, func(i, j int) bool {
+		// Extract numbers from quality strings
+		qi := extractNumber(info.Formats[i].Quality)
+		qj := extractNumber(info.Formats[j].Quality)
+		return qi > qj
+	})
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(info)
+}
+
+// Helper function to extract numbers from quality strings
+func extractNumber(quality string) int {
+	num := 0
+	fmt.Sscanf(quality, "%dp", &num)
+	return num
 }
 
 func handleDownload(w http.ResponseWriter, r *http.Request) {
@@ -118,6 +183,29 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+
+	// Get video info to include title in logging
+	cmd := exec.Command("yt-dlp", "-J", req.URL)
+	output, err := cmd.Output()
+	if err == nil {
+		var rawInfo map[string]interface{}
+		if err := json.Unmarshal(output, &rawInfo); err == nil {
+			// Add logging with title
+			log.Printf("Download request - IP: %s, URL: %s, Title: %s, Type: %s, FormatID: %s",
+				getClientIP(r),
+				req.URL,
+				rawInfo["title"].(string),
+				req.Type,
+				req.FormatID)
+		}
+	} else {
+		// Fallback logging without title if we can't get it
+		log.Printf("Download request - IP: %s, URL: %s, Type: %s, FormatID: %s",
+			getClientIP(r),
+			req.URL,
+			req.Type,
+			req.FormatID)
 	}
 
 	// Create temporary directory
@@ -136,15 +224,25 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 	if req.Type == "audio" {
 		args = append(args, "-x", "--audio-format", "mp3")
 	} else if req.FormatID != "" {
-		args = append(args, "-f", req.FormatID)
+		// For video, merge with best audio
+		args = append(args, "-f", fmt.Sprintf("%s+bestaudio", req.FormatID))
 	}
 
 	args = append(args, req.URL)
-	cmd := exec.Command("yt-dlp", args...)
+	cmd = exec.Command("yt-dlp", args...)
+
+	// Capture stderr for error messages
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 
 	// Execute the command
 	if err := cmd.Run(); err != nil {
-		http.Error(w, "Failed to download media", http.StatusInternalServerError)
+		errorMsg := stderr.String()
+		if errorMsg == "" {
+			errorMsg = "Failed to download media"
+		}
+		log.Printf("Download error: %v - %s", err, errorMsg)
+		http.Error(w, errorMsg, http.StatusInternalServerError)
 		return
 	}
 
